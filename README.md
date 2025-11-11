@@ -11,3 +11,4 @@ Abrir en Android Studio / VS Code y ejecutar:
 flutter pub get
 flutter run
 ```
+# trabajo-final-amorosi
