@@ -37,100 +37,251 @@ class _CalendarScreenState extends State<CalendarScreen> {
   late Map<DateTime, List<Task>> _tasks;
   DateTime _focusedDay = DateTime.now();
   DateTime? _selectedDay;
+  bool _isLoading = false;
 
   @override
   void initState() {
     super.initState();
     _tasks = {};
+    _selectedDay = _focusedDay;
     _loadTasks();
   }
 
+  DateTime _normalizeDate(DateTime date) {
+    return DateTime.utc(date.year, date.month, date.day);
+  }
+
   Future<void> _loadTasks() async {
-    final prefs = await SharedPreferences.getInstance();
-    final data = prefs.getString('tasks_${widget.username}');
-    if (data != null) {
-      final decoded = jsonDecode(data) as List;
-      final loaded = decoded.map((e) => Task.fromJson(e)).toList();
-      setState(() {
-        for (var task in loaded) {
-          final day = DateTime.utc(task.dateTime.year, task.dateTime.month, task.dateTime.day);
-          _tasks[day] = [...(_tasks[day] ?? []), task];
-        }
-      });
+    setState(() => _isLoading = true);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final data = prefs.getString('tasks_${widget.username}');
+      if (data != null) {
+        final decoded = jsonDecode(data) as List;
+        final loaded = decoded.map((e) => Task.fromJson(e)).toList();
+        setState(() {
+          _tasks.clear();
+          for (var task in loaded) {
+            final day = _normalizeDate(task.dateTime);
+            _tasks[day] = [...(_tasks[day] ?? []), task];
+          }
+        });
+      }
+    } catch (e) {
+      _showErrorSnackBar('Error al cargar las tareas: $e');
+    } finally {
+      setState(() => _isLoading = false);
     }
   }
 
   Future<void> _saveTasks() async {
-    final prefs = await SharedPreferences.getInstance();
-    final allTasks = _tasks.values.expand((e) => e).toList();
-    await prefs.setString('tasks_${widget.username}', jsonEncode(allTasks));
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final allTasks = _tasks.values.expand((e) => e).toList();
+      await prefs.setString('tasks_${widget.username}', jsonEncode(allTasks));
+    } catch (e) {
+      _showErrorSnackBar('Error al guardar las tareas: $e');
+    }
   }
 
   void _addTask(String title, DateTime dateTime) async {
-    if (dateTime.isBefore(DateTime.now())) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No puedes agregar tareas en fechas pasadas')),
-      );
+    if (title.trim().isEmpty) {
+      _showErrorSnackBar('El título no puede estar vacío');
+      return;
+    }
+
+    final now = DateTime.now();
+    if (dateTime.isBefore(DateTime(now.year, now.month, now.day))) {
+      _showErrorSnackBar('No puedes agregar tareas en fechas pasadas');
       return;
     }
 
     final task = Task(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
-      title: title,
+      title: title.trim(),
       dateTime: dateTime,
     );
 
     setState(() {
-      final day = DateTime.utc(dateTime.year, dateTime.month, dateTime.day);
+      final day = _normalizeDate(dateTime);
       _tasks[day] = [...(_tasks[day] ?? []), task];
     });
 
     await _saveTasks();
+    _showSuccessSnackBar('Tarea agregada correctamente');
   }
 
   void _deleteTask(Task task) async {
-    setState(() {
-      _tasks.forEach((key, list) => list.removeWhere((t) => t.id == task.id));
-    });
-    await _saveTasks();
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Confirmar eliminación'),
+        content: Text('¿Deseas eliminar la tarea "${task.title}"?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Eliminar'),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldDelete == true) {
+      setState(() {
+        _tasks.forEach((key, list) => list.removeWhere((t) => t.id == task.id));
+        _tasks.removeWhere((key, list) => list.isEmpty);
+      });
+      await _saveTasks();
+      _showSuccessSnackBar('Tarea eliminada');
+    }
   }
 
   void _editTask(Task task) async {
     final controller = TextEditingController(text: task.title);
+    DateTime selectedDate = task.dateTime;
+    TimeOfDay selectedTime = TimeOfDay.fromDateTime(task.dateTime);
+
     await showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Editar tarea'),
-        content: TextField(controller: controller),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar')),
-          TextButton(
-            onPressed: () {
-              setState(() {
-                final updated = Task(
-                  id: task.id,
-                  title: controller.text,
-                  dateTime: task.dateTime,
-                );
-                final day =
-                    DateTime.utc(task.dateTime.year, task.dateTime.month, task.dateTime.day);
-                _tasks[day] = _tasks[day]!
-                    .map((t) => t.id == task.id ? updated : t)
-                    .toList();
-              });
-              _saveTasks();
-              Navigator.pop(context);
-            },
-            child: const Text('Guardar'),
+      builder: (_) => StatefulBuilder(
+        builder: (context, setStateDialog) => AlertDialog(
+          title: const Text('Editar tarea'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: controller,
+                  decoration: const InputDecoration(
+                    labelText: 'Título',
+                    border: OutlineInputBorder(),
+                  ),
+                  autofocus: true,
+                ),
+                const SizedBox(height: 15),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.calendar_today),
+                        label: Text(
+                          '${selectedDate.day}/${selectedDate.month}/${selectedDate.year}',
+                        ),
+                        onPressed: () async {
+                          final date = await showDatePicker(
+                            context: context,
+                            initialDate: selectedDate,
+                            firstDate: DateTime.now(),
+                            lastDate: DateTime(2100),
+                          );
+                          if (date != null) {
+                            setStateDialog(() => selectedDate = date);
+                          }
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.access_time),
+                        label: Text(
+                          '${selectedTime.hour.toString().padLeft(2, '0')}:${selectedTime.minute.toString().padLeft(2, '0')}',
+                        ),
+                        onPressed: () async {
+                          final time = await showTimePicker(
+                            context: context,
+                            initialTime: selectedTime,
+                          );
+                          if (time != null) {
+                            setStateDialog(() => selectedTime = time);
+                          }
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
-        ],
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (controller.text.trim().isEmpty) {
+                  _showErrorSnackBar('El título no puede estar vacío');
+                  return;
+                }
+
+                final dateTime = DateTime(
+                  selectedDate.year,
+                  selectedDate.month,
+                  selectedDate.day,
+                  selectedTime.hour,
+                  selectedTime.minute,
+                );
+
+                setState(() {
+                  // Eliminar de la ubicación anterior
+                  _tasks.forEach((key, list) => list.removeWhere((t) => t.id == task.id));
+                  _tasks.removeWhere((key, list) => list.isEmpty);
+
+                  // Agregar en la nueva ubicación
+                  final updated = Task(
+                    id: task.id,
+                    title: controller.text.trim(),
+                    dateTime: dateTime,
+                  );
+                  final day = _normalizeDate(dateTime);
+                  _tasks[day] = [...(_tasks[day] ?? []), updated];
+                });
+
+                _saveTasks();
+                Navigator.pop(context);
+                _showSuccessSnackBar('Tarea actualizada');
+              },
+              child: const Text('Guardar'),
+            ),
+          ],
+        ),
       ),
     );
   }
 
   List<Task> _getTasksForDay(DateTime day) {
-    final date = DateTime.utc(day.year, day.month, day.day);
-    return _tasks[date] ?? [];
+    final date = _normalizeDate(day);
+    final tasks = _tasks[date] ?? [];
+    tasks.sort((a, b) => a.dateTime.compareTo(b.dateTime));
+    return tasks;
+  }
+
+  void _showErrorSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red.shade700,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  void _showSuccessSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.green.shade700,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   @override
@@ -146,15 +297,35 @@ class _CalendarScreenState extends State<CalendarScreen> {
         elevation: 0,
         actions: [
           IconButton(
-            icon: const Icon(Icons.switch_account, color: Colors.white),
-            tooltip: 'Cambiar de cuenta',
+            icon: const Icon(Icons.logout, color: Colors.white),
+            tooltip: 'Cerrar sesión',
             onPressed: () async {
-              await UserService.logout();
-              if (!context.mounted) return;
-              Navigator.pushReplacement(
-                context,
-                MaterialPageRoute(builder: (_) => const LoginScreen()),
+              final shouldLogout = await showDialog<bool>(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Cerrar sesión'),
+                  content: const Text('¿Deseas cerrar sesión?'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const Text('Cancelar'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(context, true),
+                      child: const Text('Cerrar sesión'),
+                    ),
+                  ],
+                ),
               );
+
+              if (shouldLogout == true) {
+                await UserService.logout();
+                if (!context.mounted) return;
+                Navigator.pushReplacement(
+                  context,
+                  MaterialPageRoute(builder: (_) => const LoginScreen()),
+                );
+              }
             },
           )
         ],
@@ -171,9 +342,11 @@ class _CalendarScreenState extends State<CalendarScreen> {
           children: [
             const SizedBox(height: 100),
             Card(
-              color: Colors.white.withOpacity(0.9),
+              color: Colors.white.withOpacity(0.95),
               margin: const EdgeInsets.symmetric(horizontal: 16),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+              ),
               child: Padding(
                 padding: const EdgeInsets.all(8.0),
                 child: TableCalendar(
@@ -191,7 +364,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
                   headerStyle: const HeaderStyle(
                     titleCentered: true,
                     formatButtonVisible: false,
-                    titleTextStyle: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    titleTextStyle: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   calendarStyle: CalendarStyle(
                     todayDecoration: BoxDecoration(
@@ -203,65 +379,41 @@ class _CalendarScreenState extends State<CalendarScreen> {
                       shape: BoxShape.circle,
                     ),
                     weekendTextStyle: const TextStyle(color: Colors.redAccent),
+                    markerDecoration: const BoxDecoration(
+                      color: Colors.orange,
+                      shape: BoxShape.circle,
+                    ),
                   ),
+                  eventLoader: _getTasksForDay,
                 ),
               ),
             ),
             const SizedBox(height: 10),
             Expanded(
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 300),
-                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.95),
-                  borderRadius: BorderRadius.circular(20),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black26,
-                      blurRadius: 10,
-                      offset: const Offset(0, 4),
+              child: _isLoading
+                  ? const Center(
+                      child: CircularProgressIndicator(color: Colors.white),
                     )
-                  ],
-                ),
-                child: ListView(
-                  children: _getTasksForDay(_selectedDay ?? _focusedDay)
-                      .map(
-                        (t) => Card(
-                          elevation: 3,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-                          margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
-                          child: ListTile(
-                            leading: CircleAvatar(
-                              backgroundColor: Colors.indigo.shade200,
-                              child: const Icon(Icons.event_note, color: Colors.white),
-                            ),
-                            title: Text(
-                              t.title,
-                              style: const TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                            subtitle: Text(
-                              '${t.dateTime.hour.toString().padLeft(2, '0')}:${t.dateTime.minute.toString().padLeft(2, '0')} hs',
-                            ),
-                            trailing: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                IconButton(
-                                  icon: const Icon(Icons.edit, color: Colors.blueAccent),
-                                  onPressed: () => _editTask(t),
-                                ),
-                                IconButton(
-                                  icon: const Icon(Icons.delete, color: Colors.redAccent),
-                                  onPressed: () => _deleteTask(t),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      )
-                      .toList(),
-                ),
-              ),
+                  : AnimatedContainer(
+                      duration: const Duration(milliseconds: 300),
+                      margin: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.95),
+                        borderRadius: BorderRadius.circular(20),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black26,
+                            blurRadius: 10,
+                            offset: Offset(0, 4),
+                          )
+                        ],
+                      ),
+                      child: _buildTasksList(),
+                    ),
             ),
           ],
         ),
@@ -278,88 +430,167 @@ class _CalendarScreenState extends State<CalendarScreen> {
         child: FloatingActionButton(
           backgroundColor: Colors.transparent,
           elevation: 0,
-          onPressed: () async {
-            final controller = TextEditingController();
-            DateTime selectedDate = _selectedDay ?? DateTime.now();
-            TimeOfDay selectedTime = TimeOfDay.now();
+          onPressed: _showAddTaskDialog,
+          child: const Icon(Icons.add, color: Colors.white),
+        ),
+      ),
+    );
+  }
 
-            await showDialog(
-              context: context,
-              builder: (_) => StatefulBuilder(
-                builder: (context, setStateDialog) => AlertDialog(
-                  title: const Text('Nueva tarea'),
-                  content: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      TextField(
-                        controller: controller,
-                        decoration: const InputDecoration(labelText: 'Título'),
-                      ),
-                      const SizedBox(height: 15),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextButton.icon(
-                              icon: const Icon(Icons.calendar_today),
-                              label: Text(
-                                '${selectedDate.day}/${selectedDate.month}/${selectedDate.year}',
-                              ),
-                              onPressed: () async {
-                                final date = await showDatePicker(
-                                  context: context,
-                                  initialDate: selectedDate,
-                                  firstDate: DateTime.now(),
-                                  lastDate: DateTime(2100),
-                                );
-                                if (date != null) {
-                                  setStateDialog(() => selectedDate = date);
-                                }
-                              },
-                            ),
-                          ),
-                          Expanded(
-                            child: TextButton.icon(
-                              icon: const Icon(Icons.access_time),
-                              label: Text(
-                                '${selectedTime.hour.toString().padLeft(2, '0')}:${selectedTime.minute.toString().padLeft(2, '0')}',
-                              ),
-                              onPressed: () async {
-                                final time = await showTimePicker(
-                                  context: context,
-                                  initialTime: selectedTime,
-                                );
-                                if (time != null) {
-                                  setStateDialog(() => selectedTime = time);
-                                }
-                              },
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
+  Widget _buildTasksList() {
+    final tasks = _getTasksForDay(_selectedDay ?? _focusedDay);
+
+    if (tasks.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.event_available,
+              size: 64,
+              color: Colors.grey.shade400,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'No hay tareas para este día',
+              style: TextStyle(
+                fontSize: 16,
+                color: Colors.grey.shade600,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return ListView.builder(
+      itemCount: tasks.length,
+      itemBuilder: (context, index) {
+        final task = tasks[index];
+        return Card(
+          elevation: 3,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(15),
+          ),
+          margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+          child: ListTile(
+            leading: CircleAvatar(
+              backgroundColor: Colors.indigo.shade200,
+              child: const Icon(Icons.event_note, color: Colors.white),
+            ),
+            title: Text(
+              task.title,
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            subtitle: Text(
+              '${task.dateTime.hour.toString().padLeft(2, '0')}:${task.dateTime.minute.toString().padLeft(2, '0')} hs',
+            ),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.edit, color: Colors.blueAccent),
+                  onPressed: () => _editTask(task),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.delete, color: Colors.redAccent),
+                  onPressed: () => _deleteTask(task),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _showAddTaskDialog() async {
+    final controller = TextEditingController();
+    DateTime selectedDate = _selectedDay ?? DateTime.now();
+    TimeOfDay selectedTime = TimeOfDay.now();
+
+    await showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setStateDialog) => AlertDialog(
+          title: const Text('Nueva tarea'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: controller,
+                  decoration: const InputDecoration(
+                    labelText: 'Título',
+                    border: OutlineInputBorder(),
                   ),
-                  actions: [
-                    TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancelar')),
-                    TextButton(
-                      onPressed: () {
-                        final dateTime = DateTime(
-                          selectedDate.year,
-                          selectedDate.month,
-                          selectedDate.day,
-                          selectedTime.hour,
-                          selectedTime.minute,
-                        );
-                        _addTask(controller.text, dateTime);
-                        Navigator.pop(context);
-                      },
-                      child: const Text('Agregar'),
+                  autofocus: true,
+                ),
+                const SizedBox(height: 15),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.calendar_today),
+                        label: Text(
+                          '${selectedDate.day}/${selectedDate.month}/${selectedDate.year}',
+                        ),
+                        onPressed: () async {
+                          final date = await showDatePicker(
+                            context: context,
+                            initialDate: selectedDate,
+                            firstDate: DateTime.now(),
+                            lastDate: DateTime(2100),
+                          );
+                          if (date != null) {
+                            setStateDialog(() => selectedDate = date);
+                          }
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.access_time),
+                        label: Text(
+                          '${selectedTime.hour.toString().padLeft(2, '0')}:${selectedTime.minute.toString().padLeft(2, '0')}',
+                        ),
+                        onPressed: () async {
+                          final time = await showTimePicker(
+                            context: context,
+                            initialTime: selectedTime,
+                          );
+                          if (time != null) {
+                            setStateDialog(() => selectedTime = time);
+                          }
+                        },
+                      ),
                     ),
                   ],
                 ),
-              ),
-            );
-          },
-          child: const Icon(Icons.add, color: Colors.white),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancelar'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final dateTime = DateTime(
+                  selectedDate.year,
+                  selectedDate.month,
+                  selectedDate.day,
+                  selectedTime.hour,
+                  selectedTime.minute,
+                );
+                _addTask(controller.text, dateTime);
+                Navigator.pop(context);
+              },
+              child: const Text('Agregar'),
+            ),
+          ],
         ),
       ),
     );
